@@ -1,7 +1,7 @@
 export default {
   async fetch(request, env, ctx) {
     const url = new URL(request.url);
- // hi
+
     // Initialize D1 database schema with separate exec calls
     try {
       await env.DB.exec(`
@@ -19,6 +19,7 @@ export default {
         )
       `);
     } catch (e) {
+      console.error('Database initialization error:', e);
       return new Response(JSON.stringify({ error: 'Database initialization failed: ' + e.message }), { status: 500 });
     }
 
@@ -33,6 +34,7 @@ export default {
       question = await questionResp.text();
       options = (await optionsResp.text()).split('\n').filter(opt => opt.trim());
     } catch (e) {
+      console.error('File fetch error:', e);
       return new Response(JSON.stringify({ error: 'Failed to fetch files: ' + e.message }), { status: 500 });
     }
 
@@ -45,6 +47,7 @@ export default {
     try {
       metadata = await env.DB.prepare('SELECT * FROM poll_metadata WHERE id = 1').first();
     } catch (e) {
+      console.error('Metadata query error:', e);
       return new Response(JSON.stringify({ error: 'Metadata query failed: ' + e.message }), { status: 500 });
     }
 
@@ -57,6 +60,7 @@ export default {
           .bind(questionHash, optionsHash)
           .run();
       } catch (e) {
+        console.error('Data reset error:', e);
         return new Response(JSON.stringify({ error: 'Data reset failed: ' + e.message }), { status: 500 });
       }
     }
@@ -74,6 +78,7 @@ export default {
       try {
         body = await request.json();
       } catch (e) {
+        console.error('JSON parse error:', e);
         return new Response(JSON.stringify({ error: 'Invalid JSON' }), { status: 400 });
       }
       const { fingerprint, vote } = body;
@@ -88,6 +93,7 @@ export default {
           .bind(fingerprint)
           .first();
       } catch (e) {
+        console.error('Vote check error:', e);
         return new Response(JSON.stringify({ error: 'Vote check failed: ' + e.message }), { status: 500 });
       }
       if (existingVote) {
@@ -100,6 +106,7 @@ export default {
           .bind(fingerprint, vote)
           .run();
       } catch (e) {
+        console.error('Vote recording error:', e);
         return new Response(JSON.stringify({ error: 'Vote recording failed: ' + e.message }), { status: 500 });
       }
 
@@ -114,6 +121,7 @@ export default {
           }
         });
       } catch (e) {
+        console.error('Results fetch error:', e);
         return new Response(JSON.stringify({ error: 'Results fetch failed: ' + e.message }), { status: 500 });
       }
 
