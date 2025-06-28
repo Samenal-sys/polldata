@@ -1,41 +1,64 @@
 export default {
   async fetch(request, env, ctx) {
     const url = new URL(request.url);
-
-    // Initialize D1 database schema
-    await env.DB.exec(`
-      CREATE TABLE IF NOT EXISTS votes (
-        fingerprint TEXT PRIMARY KEY,
-        vote TEXT,
-        created_at TIMESTAMP DEFAULT CURRENT_TIMESTAMP
-      );
-      CREATE TABLE IF NOT EXISTS poll_metadata (
-        id INTEGER PRIMARY KEY,
-        question_hash TEXT,
-        options_hash TEXT
-      );
-    `);
+ // hi
+    // Initialize D1 database schema with separate exec calls
+    try {
+      await env.DB.exec(`
+        CREATE TABLE IF NOT EXISTS votes (
+          fingerprint TEXT PRIMARY KEY,
+          vote TEXT,
+          created_at TIMESTAMP DEFAULT CURRENT_TIMESTAMP
+        )
+      `);
+      await env.DB.exec(`
+        CREATE TABLE IF NOT EXISTS poll_metadata (
+          id INTEGER PRIMARY KEY,
+          question_hash TEXT,
+          options_hash TEXT
+        )
+      `);
+    } catch (e) {
+      return new Response(JSON.stringify({ error: 'Database initialization failed: ' + e.message }), { status: 500 });
+    }
 
     // Read question.txt and options.txt from iil.pages.dev
-    const questionResp = await fetch('https://iil.pages.dev/question.txt');
-    const optionsResp = await fetch('https://iil.pages.dev/options.txt');
-    if (!questionResp.ok || !optionsResp.ok) {
-      return new Response(JSON.stringify({ error: 'Failed to fetch poll data' }), { status: 500 });
+    let question, options;
+    try {
+      const questionResp = await fetch('https://iil.pages.dev/question.txt');
+      const optionsResp = await fetch('https://iil.pages.dev/options.txt');
+      if (!questionResp.ok || !optionsResp.ok) {
+        return new Response(JSON.stringify({ error: 'Failed to fetch poll data' }), { status: 500 });
+      }
+      question = await questionResp.text();
+      options = (await optionsResp.text()).split('\n').filter(opt => opt.trim());
+    } catch (e) {
+      return new Response(JSON.stringify({ error: 'Failed to fetch files: ' + e.message }), { status: 500 });
     }
-    const question = await questionResp.text();
-    const options = (await optionsResp.text()).split('\n').filter(opt => opt.trim());
 
     // Generate hashes for change detection
     const questionHash = await hash(question);
     const optionsHash = await hash(options.join('\n'));
-    const metadata = await env.DB.prepare('SELECT * FROM poll_metadata WHERE id = 1').first();
+
+    // Check for poll changes
+    let metadata;
+    try {
+      metadata = await env.DB.prepare('SELECT * FROM poll_metadata WHERE id = 1').first();
+    } catch (e) {
+      return new Response(JSON.stringify({ error: 'Metadata query failed: ' + e.message }), { status: 500 });
+    }
 
     // Reset data if question or options changed
     if (!metadata || metadata.question_hash !== questionHash || metadata.options_hash !== optionsHash) {
-      await env.DB.exec('DELETE FROM votes; DELETE FROM poll_metadata;');
-      await env.DB.prepare('INSERT INTO poll_metadata (id, question_hash, options_hash) VALUES (1, ?, ?)')
-        .bind(questionHash, optionsHash)
-        .run();
+      try {
+        await env.DB.exec('DELETE FROM votes');
+        await env.DB.exec('DELETE FROM poll_metadata');
+        await env.DB.prepare('INSERT INTO poll_metadata (id, question_hash, options_hash) VALUES (1, ?, ?)')
+          .bind(questionHash, optionsHash)
+          .run();
+      } catch (e) {
+        return new Response(JSON.stringify({ error: 'Data reset failed: ' + e.message }), { status: 500 });
+      }
     }
 
     // Handle poll data request
@@ -47,33 +70,52 @@ export default {
 
     // Handle vote submission
     if (url.pathname === '/vote' && request.method === 'POST') {
-      const { fingerprint, vote } = await request.json();
+      let body;
+      try {
+        body = await request.json();
+      } catch (e) {
+        return new Response(JSON.stringify({ error: 'Invalid JSON' }), { status: 400 });
+      }
+      const { fingerprint, vote } = body;
       if (!fingerprint || !vote || !options.includes(vote)) {
         return new Response(JSON.stringify({ error: 'Invalid vote or fingerprint' }), { status: 400 });
       }
 
       // Check if fingerprint already voted
-      const existingVote = await env.DB.prepare('SELECT vote FROM votes WHERE fingerprint = ?')
-        .bind(fingerprint)
-        .first();
+      let existingVote;
+      try {
+        existingVote = await env.DB.prepare('SELECT vote FROM votes WHERE fingerprint = ?')
+          .bind(fingerprint)
+          .first();
+      } catch (e) {
+        return new Response(JSON.stringify({ error: 'Vote check failed: ' + e.message }), { status: 500 });
+      }
       if (existingVote) {
         return new Response(JSON.stringify({ error: 'You have already voted' }), { status: 400 });
       }
 
       // Record vote
-      await env.DB.prepare('INSERT INTO votes (fingerprint, vote) VALUES (?, ?)')
-        .bind(fingerprint, vote)
-        .run();
+      try {
+        await env.DB.prepare('INSERT INTO votes (fingerprint, vote) VALUES (?, ?)')
+          .bind(fingerprint, vote)
+          .run();
+      } catch (e) {
+        return new Response(JSON.stringify({ error: 'Vote recording failed: ' + e.message }), { status: 500 });
+      }
 
       // Get results
       const results = {};
       options.forEach(opt => (results[opt] = 0));
-      const voteCounts = await env.DB.prepare('SELECT vote, COUNT(*) as count FROM votes GROUP BY vote').all();
-      voteCounts.results.forEach(row => {
-        if (options.includes(row.vote)) {
-          results[row.vote] = row.count;
-        }
-      });
+      try {
+        const voteCounts = await env.DB.prepare('SELECT vote, COUNT(*) as count FROM votes GROUP BY vote').all();
+        voteCounts.results.forEach(row => {
+          if (options.includes(row.vote)) {
+            results[row.vote] = row.count;
+          }
+        });
+      } catch (e) {
+        return new Response(JSON.stringify({ error: 'Results fetch failed: ' + e.message }), { status: 500 });
+      }
 
       return new Response(JSON.stringify({ results }), {
         headers: { 'Content-Type': 'application/json' }
