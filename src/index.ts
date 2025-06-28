@@ -1,5 +1,5 @@
 interface Env {
-  DB: D1Database;
+  KV_POLLS: KVNamespace;
 }
 
 interface PollData {
@@ -17,7 +17,6 @@ interface VoteResult {
 }
 
 interface Metadata {
-  id: number;
   question_hash: string;
   options_hash: string;
 }
@@ -32,26 +31,6 @@ async function hash(str: string): Promise<string> {
 export default {
   async fetch(request: Request, env: Env, ctx: ExecutionContext): Promise<Response> {
     const url = new URL(request.url);
-
-    // Initialize D1 database schema with separate exec calls
-    try {
-      await env.DB.exec(`
-        CREATE TABLE IF NOT EXISTS votes (
-          fingerprint TEXT PRIMARY KEY,
-          vote TEXT,
-          created_at TIMESTAMP DEFAULT CURRENT_TIMESTAMP
-        )
-      `);
-      await env.DB.exec(`
-        CREATE TABLE IF NOT EXISTS poll_metadata (
-          id INTEGER PRIMARY KEY,
-          question_hash TEXT,
-          options_hash TEXT
-        )
-      `);
-    } catch (e) {
-      return new Response(JSON.stringify({ error: 'Database initialization failed: ' + (e as Error).message }), { status: 500 });
-    }
 
     // Read question.txt and options.txt from iil.pages.dev
     let question: string, options: string[];
@@ -77,19 +56,20 @@ export default {
     // Check for poll changes
     let metadata: Metadata | null;
     try {
-      metadata = await env.DB.prepare('SELECT * FROM poll_metadata WHERE id = 1').first() as Metadata | null;
+      const metadataStr = await env.KV_POLLS.get('metadata');
+      metadata = metadataStr ? JSON.parse(metadataStr) as Metadata : null;
     } catch (e) {
-      return new Response(JSON.stringify({ error: 'Metadata query failed: ' + (e as Error).message }), { status: 500 });
+      return new Response(JSON.stringify({ error: 'Metadata fetch failed: ' + (e as Error).message }), { status: 500 });
     }
 
     // Reset data if question or options changed
     if (!metadata || metadata.question_hash !== questionHash || metadata.options_hash !== optionsHash) {
       try {
-        await env.DB.exec('DELETE FROM votes');
-        await env.DB.exec('DELETE FROM poll_metadata');
-        await env.DB.prepare('INSERT INTO poll_metadata (id, question_hash, options_hash) VALUES (1, ?, ?)')
-          .bind(questionHash, optionsHash)
-          .run();
+        // List all keys and delete votes (KV prefix 'votes:')
+        const voteKeys = await env.KV_POLLS.list({ prefix: 'votes:' });
+        const deletePromises = voteKeys.keys.map(key => env.KV_POLLS.delete(key.name));
+        await Promise.all(deletePromises);
+        await env.KV_POLLS.put('metadata', JSON.stringify({ question_hash: questionHash, options_hash: optionsHash }));
       } catch (e) {
         return new Response(JSON.stringify({ error: 'Data reset failed: ' + (e as Error).message }), { status: 500 });
       }
@@ -117,23 +97,19 @@ export default {
       }
 
       // Check if fingerprint already voted
-      let existingVote: { vote?: string } | null;
+      let existingVote: string | null;
       try {
-        existingVote = await env.DB.prepare('SELECT vote FROM votes WHERE fingerprint = ?')
-          .bind(fingerprint)
-          .first();
+        existingVote = await env.KV_POLLS.get(`votes:${fingerprint}`);
       } catch (e) {
         return new Response(JSON.stringify({ error: 'Vote check failed: ' + (e as Error).message }), { status: 500 });
       }
-      if (existingVote && existingVote.vote) {
+      if (existingVote) {
         return new Response(JSON.stringify({ error: 'You have already voted' }), { status: 400 });
       }
 
       // Record vote
       try {
-        await env.DB.prepare('INSERT INTO votes (fingerprint, vote) VALUES (?, ?)')
-          .bind(fingerprint, vote)
-          .run();
+        await env.KV_POLLS.put(`votes:${fingerprint}`, vote);
       } catch (e) {
         return new Response(JSON.stringify({ error: 'Vote recording failed: ' + (e as Error).message }), { status: 500 });
       }
@@ -142,10 +118,11 @@ export default {
       let results: VoteResult = {};
       options.forEach(opt => (results[opt] = 0));
       try {
-        const voteCounts = await env.DB.prepare('SELECT vote, COUNT(*) as count FROM votes GROUP BY vote').all();
-        voteCounts.results.forEach((row: { vote: string; count: number }) => {
-          if (options.includes(row.vote)) {
-            results[row.vote] = row.count;
+        const voteKeys = await env.KV_POLLS.list({ prefix: 'votes:' });
+        voteKeys.keys.forEach(key => {
+          const voteValue = key.name.split(':')[1];
+          if (options.includes(voteValue)) {
+            results[voteValue] = (results[voteValue] || 0) + 1;
           }
         });
       } catch (e) {
